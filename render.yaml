@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: tradelocker-brandsocket-relay
+    env: node
+    plan: starter
+    buildCommand: 'npm ci'
+    startCommand: 'node server.js'
+    envVars:
+      - key: TL_SERVER
+        value: https://api.tradelocker.com
+      - key: TL_ENV
+        value: LIVE
+      - key: TL_BRAND_KEY
+        sync: false
+      - key: READ_TOKEN
+        generateValue: true
+      - key: HEARTBEAT_MS
+        value: '1000'
+      - key: REFRESH_MS
+        value: '5000'
+      - key: STALE_MS
+        value: '120000'
+      - key: SELECT_TTL_MS
+        value: '600000'
