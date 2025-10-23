@@ -1,271 +1,304 @@
-// ---------- TradeLocker BrandSocket Relay (Accounts-only: Equity/HWM/DD/Balance) ----------
+// TradeLocker BrandSocket Relay — full coverage (accounts, positions, orders, quotes)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { io } = require('socket.io-client');
 
-// ---- Boot diagnostics ----
-const BOOT_AT = new Date().toISOString();
-const SERVER = process.env.TL_SERVER || 'https://api.tradelocker.com';
-const TYPE = process.env.TL_ENV || 'LIVE';
-const KEY = process.env.TL_BRAND_KEY;
-const PORT = Number(process.env.PORT || 8080);
-console.log('[BOOT]', { BOOT_AT, TYPE, SERVER, KEY_SET: !!KEY, PORT });
-
-// ---- App setup ----
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---- Config defaults ----
-const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 1000);
-const REFRESH_MS = Number(process.env.REFRESH_MS || 5000);
-const STALE_MS = Number(process.env.STALE_MS || 120000);
-const SELECT_TTL_MS = Number(process.env.SELECT_TTL_MS || 10 * 60 * 1000);
-const READ_TOKEN = process.env.READ_TOKEN || '';
+// -------- Config per spec --------
+const SERVER = process.env.TL_SERVER || 'https://api.tradelocker.com'; // use api-dev host for DEMO if needed
+const TYPE   = process.env.TL_ENV    || 'LIVE';  // 'LIVE' | 'DEMO' (sent as query ?type=)
+const KEY    = process.env.TL_BRAND_KEY;
+const PORT   = Number(process.env.PORT || 8080);
+const READ_TOKEN    = process.env.READ_TOKEN || '';
+const HEARTBEAT_MS  = Number(process.env.HEARTBEAT_MS || 1000);
+const REFRESH_MS    = Number(process.env.REFRESH_MS   || 5000);
+const STALE_MS      = Number(process.env.STALE_MS     || 120000);
+const SELECT_TTL_MS = Number(process.env.SELECT_TTL_MS || 600000);
+if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 
-if (!KEY) {
-  console.error('Missing TL_BRAND_KEY');
-  process.exit(1);
-}
-
-// ---- State ----
-const state = new Map();
+// -------- State --------
+/** ACCOUNTS: id -> summary */
+const ACCOUNTS = new Map();
+/** POSITIONS: accountId -> Map<positionId, obj> */
+const POSITIONS = new Map();
+/** ORDERS: accountId -> Map<orderId, obj> */
+const ORDERS = new Map();
+/** QUOTES: instrument -> last quote */
+const QUOTES = new Map();
+/** selections: token -> { set:Set<string>, expiresAt:number } */
 const selections = new Map();
-const ddSubs = new Set();
-const evtSubs = new Set();
+
+// SSE subscribers
+const subs = {
+  accounts: new Set(),  // {res, filter:Set, ping, refresh}
+  positions: new Set(),
+  orders: new Set(),
+  quotes: new Set(),
+  events: new Set(),    // raw socket events
+};
+
 let lastBrandEventAt = 0;
 let lastConnectError = '';
 let initialSyncDone = false;
 
-// ---- Helpers ----
-const num = (x) => {
-  const n = parseFloat(x);
-  return Number.isFinite(n) ? n : 0;
-};
-const makeToken = () =>
-  Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+// -------- Utils --------
+const num = (x)=>{ const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
+const j = (o)=> `data: ${JSON.stringify(o)}\n\n`;
+const makeToken = ()=> Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2);
+function ensureMap(m,k){ if(!m.has(k)) m.set(k,new Map()); return m.get(k); }
+function parseSet(v){ if(Array.isArray(v)) v=v.join(','); return new Set(String(v||'').split(',').map(s=>s.trim()).filter(Boolean)); }
+function parseBalance(m){ for(const k of ['balance','accountBalance','cash','cashBalance','Balance']){ const n=Number(m?.[k]); if(Number.isFinite(n)) return n; } return NaN; }
+function sse(res){ res.writeHead(200, {'Content-Type':'text/event-stream','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','Access-Control-Allow-Origin':'*','X-Accel-Buffering':'no'}); }
+function heartbeat(res){ return setInterval(()=>res.write(`: ping\n\n`), HEARTBEAT_MS); }
+function tokenSet(tok){ if(!tok) return null; const r=selections.get(String(tok)); if(!r) return null; r.expiresAt=Date.now()+SELECT_TTL_MS; return r.set; }
+function checkToken(req,res){ if(!READ_TOKEN) return true; const p=String(req.query.token||req.headers['x-read-token']||''); if(p===READ_TOKEN) return true; res.status(401).json({ok:false,error:'unauthorized'}); return false; }
+setInterval(()=>{ const now=Date.now(); for(const [t,v] of selections) if(v.expiresAt<=now) selections.delete(t); }, 60_000);
 
-function parseAccountsParam(q) {
-  if (Array.isArray(q)) q = q.join(',');
-  const raw = String(q || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return new Set(raw);
-}
-function getSelectionFromToken(selToken) {
-  if (!selToken) return null;
-  const rec = selections.get(String(selToken));
-  if (!rec) return null;
-  rec.expiresAt = Date.now() + SELECT_TTL_MS;
-  return rec.set;
-}
-function checkToken(req, res) {
-  if (!READ_TOKEN) return true;
-  const provided = String(req.query.token || req.headers['x-read-token'] || '');
-  if (provided === READ_TOKEN) return true;
-  res.status(401).json({ ok: false, error: 'unauthorized' });
-  return false;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [t, v] of selections) if (v.expiresAt <= now) selections.delete(t);
-}, 60000);
-
-function parseBalance(m) {
-  for (const k of ['balance', 'accountBalance', 'cash', 'cashBalance']) {
-    const v = m?.[k];
-    if (v !== undefined && v !== null && v !== '') {
-      const n = Number(v);
-      if (Number.isFinite(n)) return n;
-    }
-  }
-  return NaN;
-}
-
-// ---- Account handling ----
-function updateAccount(m) {
-  const id =
-    m.accountId || m.account?.id || m.accId || String(m?.accountID || '');
-  if (!id) return;
-
-  const eq = num(m.equity ?? m.Equity);
-  const cur = m.currency || m.Currency || 'USD';
-  const now = Date.now();
-
-  if (!state.has(id)) {
-    state.set(id, {
-      hwm: eq,
-      equity: eq,
-      maxDD: 0,
-      currency: cur,
-      updatedAt: now,
-      balance: NaN,
-    });
-  }
-  const s = state.get(id);
-  const bal = parseBalance(m);
-  if (Number.isFinite(bal)) s.balance = bal;
-
-  if (eq > s.hwm) s.hwm = eq;
-  s.equity = eq;
-  s.currency = cur;
-  s.updatedAt = now;
-
-  const dd = s.hwm > 0 ? (s.hwm - s.equity) / s.hwm : 0;
-  if (dd > s.maxDD) s.maxDD = dd;
-  pushDD(s, id);
-}
-
-function buildDDPayload(id) {
-  const s = state.get(id);
-  if (!s) return null;
-  const dd = s.hwm > 0 ? (s.hwm - s.equity) / s.hwm : 0;
-  let instPct = null;
-  if (Number.isFinite(s.balance) && s.balance > 0)
-    instPct = ((s.equity - s.balance) / s.balance) * 100;
-
+// -------- Builders --------
+function buildAccountPayload(id){
+  const s=ACCOUNTS.get(id); if(!s) return null;
+  const dd = s.hwm>0 ? (s.hwm - s.equity)/s.hwm : 0;
+  let instPct=null; if(Number.isFinite(s.balance)&&s.balance>0) instPct=((s.equity-s.balance)/s.balance)*100;
   return {
-    type: 'account',
-    accountId: id,
-    equity: Number(s.equity.toFixed(2)),
-    hwm: Number(s.hwm.toFixed(2)),
-    dd,
-    ddPct: Number((dd * 100).toFixed(2)),
-    maxDDPct: Number((s.maxDD * 100).toFixed(2)),
-    balance: Number.isFinite(s.balance)
-      ? Number(s.balance.toFixed(2))
-      : null,
-    instPct: instPct !== null ? Number(instPct.toFixed(2)) : null,
-    currency: s.currency,
-    updatedAt: s.updatedAt,
-    serverTime: Date.now(),
+    type:'account', accountId:id,
+    equity:+s.equity.toFixed(2), hwm:+s.hwm.toFixed(2),
+    dd, ddPct:+(dd*100).toFixed(2), maxDDPct:+((s.maxDD||0)*100).toFixed(2),
+    balance:Number.isFinite(s.balance)?+s.balance.toFixed(2):null,
+    instPct:instPct!==null?+instPct.toFixed(2):null,
+    currency:s.currency, marginAvailable:s.marginAvailable??null, marginUsed:s.marginUsed??null,
+    credit:s.credit??null, blockedBalance:s.blockedBalance??null,
+    updatedAt:s.updatedAt, serverTime:Date.now()
   };
 }
-function pushDD(_s, accountId) {
-  const payload = buildDDPayload(accountId);
-  if (!payload) return;
-  for (const sub of ddSubs) {
-    if (sub.filter.size && !sub.filter.has(accountId)) continue;
-    sub.res.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
+
+// -------- Updaters --------
+function updateAccount(m){
+  const id = m.accountId || m.account?.id || m.accId || String(m?.accountID||''); if(!id) return;
+  const now=Date.now(); const cur=m.currency||m.Currency||'USD'; const eq=num(m.equity??m.Equity);
+  const bal=parseBalance(m);
+
+  let s=ACCOUNTS.get(id);
+  if(!s) s={ hwm:eq, equity:eq, maxDD:0, currency:cur, balance:NaN, updatedAt:now };
+  s.currency=cur; s.equity=eq; if(Number.isFinite(bal)) s.balance=bal;
+  const marginAvailable=num(m.marginAvailable); if(marginAvailable) s.marginAvailable=marginAvailable;
+  const marginUsed=num(m.marginUsed); if(marginUsed) s.marginUsed=marginUsed;
+  const credit=num(m.credit); if(credit) s.credit=credit;
+  const blocked=num(m.blockedBalance); if(blocked) s.blockedBalance=blocked;
+
+  if(eq>(s.hwm||0)) s.hwm=eq;
+  const dd=s.hwm>0?(s.hwm-s.equity)/s.hwm:0; if(dd>(s.maxDD||0)) s.maxDD=dd;
+  s.updatedAt=now; ACCOUNTS.set(id,s);
+
+  for(const sub of subs.accounts){ if(sub.filter.size && !sub.filter.has(id)) continue; sub.res.write(j(buildAccountPayload(id))); }
 }
-function broadcastEvent(m) {
-  const acct = m.accountId || m.account?.id || m.accId || '';
-  const line = `data: ${JSON.stringify(m)}\n\n`;
-  for (const sub of evtSubs) {
-    if (sub.filter?.size && acct && !sub.filter.has(acct)) continue;
-    sub.res.write(line);
-  }
+function upsertPosition(m){
+  const accountId=m.accountId||m.account?.id; const id=m.positionId||m.id; if(!accountId||!id) return;
+  const bucket=ensureMap(POSITIONS, accountId); bucket.set(String(id), m);
+  for(const sub of subs.positions){ if(sub.filter.size && !sub.filter.has(accountId)) continue; sub.res.write(j({type:'position', accountId, position:m})); }
+}
+function closePosition(m){
+  const accountId=m.accountId||m.account?.id; const id=m.positionId||m.id; const bucket=ensureMap(POSITIONS, accountId); bucket.delete(String(id));
+  for(const sub of subs.positions){ if(sub.filter.size && !sub.filter.has(accountId)) continue; sub.res.write(j({type:'positionClosed', accountId, positionId:id, payload:m})); }
+}
+function upsertOrder(m){
+  const accountId=m.accountId||m.account?.id; const id=m.orderId||m.id; if(!accountId||!id) return;
+  const bucket=ensureMap(ORDERS, accountId); bucket.set(String(id), m);
+  for(const sub of subs.orders){ if(sub.filter.size && !sub.filter.has(accountId)) continue; sub.res.write(j({type:'order', accountId, order:m})); }
+}
+function removeOrder(m){
+  const accountId=m.accountId||m.account?.id; const id=m.orderId||m.id; const bucket=ensureMap(ORDERS, accountId); bucket.delete(String(id));
+  for(const sub of subs.orders){ if(sub.filter.size && !sub.filter.has(accountId)) continue; sub.res.write(j({type:'orderRemoved', accountId, orderId:id, payload:m})); }
+}
+function upsertQuote(q){
+  const instrument=q.instrument||q.symbol; if(!instrument) return;
+  QUOTES.set(instrument, q);
+  for(const sub of subs.quotes){ if(sub.filter.size && !sub.filter.has(instrument)) continue; sub.res.write(j({type:'quote', instrument, quote:q})); }
 }
 
-// ---- Brand Socket ----
+// -------- BrandSocket (per docs: namespace, path, header, query type) --------
 const socket = io(SERVER + '/brand-socket', {
   path: '/brand-api/socket.io',
   transports: ['websocket'],
-  query: { type: TYPE },
-  extraHeaders: { 'brand-api-key': KEY },
-  reconnection: true,
-  reconnectionAttempts: Infinity,
-  reconnectionDelay: 1000,
-  reconnectionDelayMax: 10000,
-  randomizationFactor: 0.5,
-  timeout: 20000,
-  forceNew: true,
+  query: { type: TYPE },                     // LIVE or DEMO
+  extraHeaders: { 'brand-api-key': KEY },    // required header
+  reconnection: true, reconnectionAttempts: Infinity,
+  reconnectionDelay: 1000, reconnectionDelayMax: 10000, randomizationFactor: 0.5,
+  timeout: 20000, forceNew: true,
 });
 
-socket.on('connect', () => {
-  console.log('[BrandSocket] connected', socket.id);
-  lastConnectError = '';
-});
-socket.on('disconnect', (reason) =>
-  console.warn('[BrandSocket] disconnected', reason)
-);
-socket.on('connect_error', (err) => {
-  lastConnectError =
-    (err && (err.message || String(err))) || 'connect_error';
-  console.error('[BrandSocket] connect_error', lastConnectError);
-});
-socket.on('error', (e) => console.error('[BrandSocket] error', e));
+// Connection + error channel (matches docs’ “connection/status/error”)
+socket.on('connect', ()=>{ lastConnectError=''; console.log('[BrandSocket] connected'); });
+socket.on('disconnect', (r)=> console.warn('[BrandSocket] disconnected', r));
+socket.on('connect_error', (e)=>{ lastConnectError=(e?.message||String(e)||'connect_error'); console.error('[BrandSocket] connect_error', lastConnectError); });
+socket.on('error', (e)=> console.error('[BrandSocket] error', e));
 
-socket.on('stream', (m) => {
-  lastBrandEventAt = Date.now();
-  const t = (m?.type || '').toString().toUpperCase();
+// Main stream: accounts, positions, orders, property SyncEnd, etc. (docs)
+socket.on('stream', (m)=>{
+  lastBrandEventAt=Date.now();
+  const t=String(m?.type||'').toUpperCase();
 
-  if (t === 'PROPERTY' && (m?.name || '').toUpperCase() === 'SYNCEND') {
-    initialSyncDone = true;
-    for (const sub of ddSubs)
-      sub.res.write(`event: syncEnd\ndata: {"ok":true}\n\n`);
+  if(t==='PROPERTY' && String(m?.name||'').toUpperCase()==='SYNCEND'){
+    initialSyncDone=true;
+    for(const set of Object.values(subs)) for(const s of set) s.res.write(`event: syncEnd\n${j({ok:true})}`);
     return;
   }
+  if(t==='ACCOUNTSTATUS' || t==='ACCOUNT' || t==='ACCOUNT_UPDATE') updateAccount(m);
+  if(t==='POSITION' || t==='POSITION_UPDATE') upsertPosition(m);
+  if(t==='CLOSEPOSITION' || t==='POSITION_CLOSED') closePosition(m);
+  if(t==='OPENORDER' || t==='ORDER' || t==='ORDER_UPDATE') upsertOrder(m);
+  if(t==='ORDER_REMOVED' || t==='ORDER_CANCELED' || t==='ORDER_CANCELLED') removeOrder(m);
 
-  if (t === 'ACCOUNTSTATUS' || t === 'ACCOUNT' || t === 'ACCOUNT_UPDATE')
-    updateAccount(m);
-
-  broadcastEvent(m);
+  // raw fan-out
+  for(const s of subs.events) s.res.write(j(m));
 });
 
-setInterval(() => {
-  if (!STALE_MS) return;
-  if (!socket.connected) {
-    const age = Date.now() - (lastBrandEventAt || 0);
-    if (age > STALE_MS) {
-      console.warn(
-        '[Watchdog] Disconnected & stale for',
-        age,
-        'ms. Exiting for restart.'
-      );
-      process.exit(1);
-    }
-  }
-}, 30000);
+// Quotes stream (docs “subscriptions” event)
+socket.on('subscriptions', (payload)=>{ if(payload && (payload.instrument||payload.symbol)) upsertQuote(payload); });
 
-// ---- Routes ----
-app.get('/health', (_req, res) =>
-  res.json({ ok: true, env: TYPE, knownAccounts: state.size })
-);
+// -------- Watchdog (handles stale connections) --------
+setInterval(()=>{
+  if(!STALE_MS) return;
+  const age=Date.now()-(lastBrandEventAt||0);
+  if(age>STALE_MS){ console.warn('[Watchdog] stale', age, 'ms; exiting'); process.exit(1); }
+}, 30_000);
 
-app.get('/brand/status', (_req, res) =>
-  res.json({
-    env: TYPE,
-    server: SERVER,
-    connected: socket.connected,
-    knownAccounts: state.size,
-    lastBrandEventAt,
-    lastConnectError,
-    initialSyncDone,
-    now: Date.now(),
-  })
-);
-
-// runtime env check (guarded)
-app.get('/_debug/env', (req, res) => {
-  const tok = String(req.query.token || req.headers['x-read-token'] || '');
-  if (READ_TOKEN && tok !== READ_TOKEN)
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  res.json({
-    ok: true,
-    TYPE,
-    SERVER,
-    KEY_SET: !!KEY,
-    PORT: process.env.PORT || 8080,
-    NODE_VERSION: process.version,
-    PWD: process.cwd(),
-  });
+// -------- Routes: selections --------
+app.post('/select/accounts', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const arr=Array.isArray(req.body?.accounts)?req.body.accounts:[];
+  const set=new Set(arr.map(String).map(s=>s.trim()).filter(Boolean));
+  if(!set.size) return res.status(400).json({ok:false,error:'no accounts'});
+  const token=makeToken(); selections.set(token,{set,expiresAt:Date.now()+SELECT_TTL_MS});
+  res.json({ok:true, token, count:set.size, ttlMs:SELECT_TTL_MS});
+});
+app.post('/select/instruments', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const arr=Array.isArray(req.body?.instruments)?req.body.instruments:[];
+  const set=new Set(arr.map(String).map(s=>s.trim()).filter(Boolean));
+  if(!set.size) return res.status(400).json({ok:false,error:'no instruments'});
+  const token=makeToken(); selections.set(token,{set,expiresAt:Date.now()+SELECT_TTL_MS});
+  res.json({ok:true, token, count:set.size, ttlMs:SELECT_TTL_MS});
 });
 
-// ---- Error hardening ----
-process.on('unhandledRejection', (r) =>
-  console.error('[unhandledRejection]', r)
-);
-process.on('uncaughtException', (e) => {
-  console.error('[uncaughtException]', e);
-  process.exit(1);
+// -------- Routes: quotes subscribe/unsubscribe (docs: subscriptions.publish) --------
+app.post('/quotes/subscribe', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const action=String(req.body?.action||'').toUpperCase();
+  const instrument=String(req.body?.instrument||'').trim();
+  if(!instrument || !['SUBSCRIBE','UNSUBSCRIBE'].includes(action)) return res.status(400).json({ok:false,error:'bad action or instrument'});
+  socket.emit('subscriptions.publish', { action, instrument }); // per docs
+  res.json({ ok:true, action, instrument });
 });
 
-// ---- Start ----
-app.listen(PORT, () =>
-  console.log(`BrandSocket relay listening on :${PORT}`)
-);
+// -------- SSE streams --------
+function openSSE(res, hello){ sse(res); res.write(`event: hello\n${j(hello)}`); return heartbeat(res); }
+
+// Accounts SSE
+app.get('/stream/accounts', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.accounts||req.query['accounts[]']);
+  const ping=openSSE(res, {ok:true, env:TYPE, initialSyncDone});
+  const sub={res, filter, ping, refresh:null}; subs.accounts.add(sub);
+  // initial snapshot
+  const ids=filter.size?Array.from(filter):Array.from(ACCOUNTS.keys());
+  for(const id of ids){ const p=buildAccountPayload(id); if(p) res.write(j(p)); }
+  if(REFRESH_MS>0) sub.refresh=setInterval(()=>{
+    const out=[]; const list=filter.size?Array.from(filter):Array.from(ACCOUNTS.keys());
+    for(const id of list){ const p=buildAccountPayload(id); if(p) out.push(p); }
+    res.write(`event: batch\n${j({serverTime:Date.now(), accounts:out})}`);
+  }, REFRESH_MS);
+  req.on('close', ()=>{ clearInterval(sub.ping); if(sub.refresh) clearInterval(sub.refresh); subs.accounts.delete(sub); });
+});
+
+// Positions SSE
+app.get('/stream/positions', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.accounts||req.query['accounts[]']);
+  const ping=openSSE(res, {ok:true, env:TYPE, initialSyncDone});
+  const sub={res, filter, ping}; subs.positions.add(sub);
+  const ids=filter.size?Array.from(filter):Array.from(POSITIONS.keys());
+  for(const acc of ids){ const bucket=POSITIONS.get(acc)||new Map(); for(const p of bucket.values()) res.write(j({type:'position', accountId:acc, position:p})); }
+  req.on('close', ()=>{ clearInterval(sub.ping); subs.positions.delete(sub); });
+});
+
+// Orders SSE
+app.get('/stream/orders', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.accounts||req.query['accounts[]']);
+  const ping=openSSE(res, {ok:true, env:TYPE, initialSyncDone});
+  const sub={res, filter, ping}; subs.orders.add(sub);
+  const ids=filter.size?Array.from(filter):Array.from(ORDERS.keys());
+  for(const acc of ids){ const bucket=ORDERS.get(acc)||new Map(); for(const o of bucket.values()) res.write(j({type:'order', accountId:acc, order:o})); }
+  req.on('close', ()=>{ clearInterval(sub.ping); subs.orders.delete(sub); });
+});
+
+// Quotes SSE
+app.get('/stream/quotes', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.instruments||req.query['instruments[]']);
+  const ping=openSSE(res, {ok:true, env:TYPE, initialSyncDone});
+  const sub={res, filter, ping}; subs.quotes.add(sub);
+  const keys=filter.size?Array.from(filter):Array.from(QUOTES.keys());
+  for(const k of keys){ const q=QUOTES.get(k); if(q) res.write(j({type:'quote', instrument:k, quote:q})); }
+  req.on('close', ()=>{ clearInterval(sub.ping); subs.quotes.delete(sub); });
+});
+
+// Raw events SSE
+app.get('/stream/events', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const ping=openSSE(res, {ok:true, env:TYPE, initialSyncDone});
+  const sub={res, filter:new Set(), ping}; subs.events.add(sub);
+  req.on('close', ()=>{ clearInterval(sub.ping); subs.events.delete(sub); });
+});
+
+// -------- Snapshots --------
+app.get('/state/accounts', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.accounts||req.query['accounts[]']);
+  const out=[]; for(const [id] of ACCOUNTS){ if(filter.size && !filter.has(id)) continue; const p=buildAccountPayload(id); if(p) out.push(p); }
+  out.sort((a,b)=> b.equity - a.equity);
+  res.json({ env:TYPE, count:out.length, accounts:out, initialSyncDone });
+});
+app.get('/state/positions', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.accounts||req.query['accounts[]']);
+  const out={}; for(const [acc,bucket] of POSITIONS){ if(filter.size && !filter.has(acc)) continue; out[acc]=Array.from(bucket.values()); }
+  res.json({ env:TYPE, positions:out, initialSyncDone });
+});
+app.get('/state/orders', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.accounts||req.query['accounts[]']);
+  const out={}; for(const [acc,bucket] of ORDERS){ if(filter.size && !filter.has(acc)) continue; out[acc]=Array.from(bucket.values()); }
+  res.json({ env:TYPE, orders:out, initialSyncDone });
+});
+app.get('/state/quotes', (req,res)=>{
+  if(!checkToken(req,res)) return;
+  const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.instruments||req.query['instruments[]']);
+  const out={}; for(const [inst,q] of QUOTES){ if(filter.size && !filter.has(inst)) continue; out[inst]=q; }
+  res.json({ env:TYPE, quotes:out, initialSyncDone });
+});
+
+// -------- Health & status --------
+app.get('/health', (_req,res)=> res.json({ ok:true, env:TYPE, connected: socket.connected, accounts: ACCOUNTS.size }));
+app.get('/brand/status', (_req,res)=> res.json({
+  env: TYPE, server: SERVER, connected: socket.connected,
+  knownAccounts: ACCOUNTS.size, lastBrandEventAt, lastConnectError, initialSyncDone, now: Date.now()
+}));
+
+// Debug env
+app.get('/_debug/env', (req,res)=>{
+  const tok=String(req.query.token||req.headers['x-read-token']||'');
+  if(READ_TOKEN && tok!==READ_TOKEN) return res.status(401).json({ok:false,error:'unauthorized'});
+  res.json({ ok:true, TYPE, SERVER, KEY_SET: !!KEY, PORT: process.env.PORT, NODE_VERSION: process.version });
+});
+
+// -------- Hardening --------
+process.on('unhandledRejection', (r)=> console.error('[unhandledRejection]', r));
+process.on('uncaughtException', (e)=>{ console.error('[uncaughtException]', e); process.exit(1); });
+
+// -------- Start --------
+app.listen(PORT, ()=> console.log(`BrandSocket Relay listening on :${PORT}`));
