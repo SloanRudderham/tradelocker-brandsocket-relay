@@ -1,4 +1,4 @@
-// TradeLocker BrandSocket Relay — full coverage (accounts, positions, orders, quotes)
+// TradeLocker BrandSocket Relay — resilient version
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -8,17 +8,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// -------- Config per spec --------
-const SERVER = process.env.TL_SERVER || 'https://api.tradelocker.com'; // use api-dev host for DEMO if needed
-const TYPE   = process.env.TL_ENV    || 'LIVE';  // 'LIVE' | 'DEMO' (sent as query ?type=)
-const KEY    = process.env.TL_BRAND_KEY;
+// -------- Config --------
+const SERVER = process.env.TL_SERVER || 'https://api.tradelocker.com'; // LIVE default
+const TYPE   = process.env.TL_ENV    || 'LIVE';                        // 'LIVE' | 'DEMO'
+const KEY    = process.env.TL_BRAND_KEY || '';
 const PORT   = Number(process.env.PORT || 8080);
 const READ_TOKEN    = process.env.READ_TOKEN || '';
 const HEARTBEAT_MS  = Number(process.env.HEARTBEAT_MS || 1000);
 const REFRESH_MS    = Number(process.env.REFRESH_MS   || 5000);
-const STALE_MS      = Number(process.env.STALE_MS     || 120000);
+// Disable stale-exit by default; use >0 to enable watchdog reconnects instead of process exit
+const STALE_MS      = Number(process.env.STALE_MS     || 0);
 const SELECT_TTL_MS = Number(process.env.SELECT_TTL_MS || 600000);
-if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 
 // -------- State --------
 /** ACCOUNTS: id -> summary */
@@ -84,10 +84,10 @@ function updateAccount(m){
   let s=ACCOUNTS.get(id);
   if(!s) s={ hwm:eq, equity:eq, maxDD:0, currency:cur, balance:NaN, updatedAt:now };
   s.currency=cur; s.equity=eq; if(Number.isFinite(bal)) s.balance=bal;
-  const marginAvailable=num(m.marginAvailable); if(marginAvailable) s.marginAvailable=marginAvailable;
-  const marginUsed=num(m.marginUsed); if(marginUsed) s.marginUsed=marginUsed;
-  const credit=num(m.credit); if(credit) s.credit=credit;
-  const blocked=num(m.blockedBalance); if(blocked) s.blockedBalance=blocked;
+  const marginAvailable=num(m.marginAvailable); if(Number.isFinite(marginAvailable)) s.marginAvailable=marginAvailable;
+  const marginUsed=num(m.marginUsed); if(Number.isFinite(marginUsed)) s.marginUsed=marginUsed;
+  const credit=num(m.credit); if(Number.isFinite(credit)) s.credit=credit;
+  const blocked=num(m.blockedBalance); if(Number.isFinite(blocked)) s.blockedBalance=blocked;
 
   if(eq>(s.hwm||0)) s.hwm=eq;
   const dd=s.hwm>0?(s.hwm-s.equity)/s.hwm:0; if(dd>(s.maxDD||0)) s.maxDD=dd;
@@ -119,25 +119,50 @@ function upsertQuote(q){
   for(const sub of subs.quotes){ if(sub.filter.size && !sub.filter.has(instrument)) continue; sub.res.write(j({type:'quote', instrument, quote:q})); }
 }
 
-// -------- BrandSocket (per docs: namespace, path, header, query type) --------
-const socket = io(SERVER + '/brand-socket', {
-  path: '/brand-api/socket.io',
-  transports: ['websocket'],
-  query: { type: TYPE },                     // LIVE or DEMO
-  extraHeaders: { 'brand-api-key': KEY },    // required header
-  reconnection: true, reconnectionAttempts: Infinity,
-  reconnectionDelay: 1000, reconnectionDelayMax: 10000, randomizationFactor: 0.5,
-  timeout: 20000, forceNew: true,
+// -------- Socket setup --------
+function createNoopSocket(){
+  return {
+    connected:false,
+    on:()=>{},
+    emit:()=>{},
+    disconnect:()=>{},
+    connect:()=>{}
+  };
+}
+
+const socket = KEY
+  ? io(SERVER + '/brand-socket', {
+      path: '/brand-api/socket.io',
+      transports: ['websocket'],
+      query: { type: TYPE },                     // LIVE or DEMO
+      extraHeaders: { 'brand-api-key': KEY },    // required header
+      reconnection: true, reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000, reconnectionDelayMax: 10000, randomizationFactor: 0.5,
+      timeout: 20000, forceNew: true,
+    })
+  : createNoopSocket();
+
+if (!KEY) {
+  console.error('[Startup] Missing TL_BRAND_KEY; running without upstream. Set TL_BRAND_KEY to enable streaming.');
+}
+
+// Connection + error channel
+socket.on && socket.on('connect', ()=>{
+  lastConnectError='';
+  console.log('[BrandSocket] connected');
+  if (!lastBrandEventAt) lastBrandEventAt = Date.now();
 });
+socket.on && socket.on('disconnect', (r)=> console.warn('[BrandSocket] disconnected', r));
+socket.on && socket.on('connect_error', (e)=>{
+  lastConnectError=(e?.message||String(e)||'connect_error');
+  console.error('[BrandSocket] connect_error', lastConnectError);
+  // gentle backoff
+  try { setTimeout(()=>socket.connect && socket.connect(), 5000); } catch {}
+});
+socket.on && socket.on('error', (e)=> console.error('[BrandSocket] error', e));
 
-// Connection + error channel (matches docs’ “connection/status/error”)
-socket.on('connect', ()=>{ lastConnectError=''; console.log('[BrandSocket] connected'); });
-socket.on('disconnect', (r)=> console.warn('[BrandSocket] disconnected', r));
-socket.on('connect_error', (e)=>{ lastConnectError=(e?.message||String(e)||'connect_error'); console.error('[BrandSocket] connect_error', lastConnectError); });
-socket.on('error', (e)=> console.error('[BrandSocket] error', e));
-
-// Main stream: accounts, positions, orders, property SyncEnd, etc. (docs)
-socket.on('stream', (m)=>{
+// Main stream
+socket.on && socket.on('stream', (m)=>{
   lastBrandEventAt=Date.now();
   const t=String(m?.type||'').toUpperCase();
 
@@ -152,18 +177,22 @@ socket.on('stream', (m)=>{
   if(t==='OPENORDER' || t==='ORDER' || t==='ORDER_UPDATE') upsertOrder(m);
   if(t==='ORDER_REMOVED' || t==='ORDER_CANCELED' || t==='ORDER_CANCELLED') removeOrder(m);
 
-  // raw fan-out
   for(const s of subs.events) s.res.write(j(m));
 });
 
-// Quotes stream (docs “subscriptions” event)
-socket.on('subscriptions', (payload)=>{ if(payload && (payload.instrument||payload.symbol)) upsertQuote(payload); });
+// Quotes stream
+socket.on && socket.on('subscriptions', (payload)=>{ if(payload && (payload.instrument||payload.symbol)) upsertQuote(payload); });
 
-// -------- Watchdog (handles stale connections) --------
+// -------- Watchdog (reconnect, no exits) --------
 setInterval(()=>{
   if(!STALE_MS) return;
   const age=Date.now()-(lastBrandEventAt||0);
-  if(age>STALE_MS){ console.warn('[Watchdog] stale', age, 'ms; exiting'); process.exit(1); }
+  if(age>STALE_MS){
+    console.warn('[Watchdog] stale', age, 'ms; forcing reconnect');
+    try { socket.disconnect && socket.disconnect(); } catch {}
+    try { socket.connect && socket.connect(); } catch {}
+    lastBrandEventAt = Date.now();
+  }
 }, 30_000);
 
 // -------- Routes: selections --------
@@ -184,17 +213,17 @@ app.post('/select/instruments', (req,res)=>{
   res.json({ok:true, token, count:set.size, ttlMs:SELECT_TTL_MS});
 });
 
-// -------- Routes: quotes subscribe/unsubscribe (docs: subscriptions.publish) --------
+// -------- Routes: quotes subscribe/unsubscribe --------
 app.post('/quotes/subscribe', (req,res)=>{
   if(!checkToken(req,res)) return;
   const action=String(req.body?.action||'').toUpperCase();
   const instrument=String(req.body?.instrument||'').trim();
   if(!instrument || !['SUBSCRIBE','UNSUBSCRIBE'].includes(action)) return res.status(400).json({ok:false,error:'bad action or instrument'});
-  socket.emit('subscriptions.publish', { action, instrument }); // per docs
+  socket.emit && socket.emit('subscriptions.publish', { action, instrument }); // upstream
   res.json({ ok:true, action, instrument });
 });
 
-// -------- SSE streams --------
+// -------- SSE helpers --------
 function openSSE(res, hello){ sse(res); res.write(`event: hello\n${j(hello)}`); return heartbeat(res); }
 
 // Accounts SSE
@@ -203,7 +232,6 @@ app.get('/stream/accounts', (req,res)=>{
   const sel=tokenSet(req.query.sel); const filter= sel || parseSet(req.query.accounts||req.query['accounts[]']);
   const ping=openSSE(res, {ok:true, env:TYPE, initialSyncDone});
   const sub={res, filter, ping, refresh:null}; subs.accounts.add(sub);
-  // initial snapshot
   const ids=filter.size?Array.from(filter):Array.from(ACCOUNTS.keys());
   for(const id of ids){ const p=buildAccountPayload(id); if(p) res.write(j(p)); }
   if(REFRESH_MS>0) sub.refresh=setInterval(()=>{
@@ -283,10 +311,11 @@ app.get('/state/quotes', (req,res)=>{
 });
 
 // -------- Health & status --------
-app.get('/health', (_req,res)=> res.json({ ok:true, env:TYPE, connected: socket.connected, accounts: ACCOUNTS.size }));
+app.get('/health', (_req,res)=> res.json({ ok:true, env:TYPE, connected: !!socket.connected, accounts: ACCOUNTS.size }));
 app.get('/brand/status', (_req,res)=> res.json({
-  env: TYPE, server: SERVER, connected: socket.connected,
-  knownAccounts: ACCOUNTS.size, lastBrandEventAt, lastConnectError, initialSyncDone, now: Date.now()
+  env: TYPE, server: SERVER, connected: !!socket.connected,
+  knownAccounts: ACCOUNTS.size, lastBrandEventAt, lastConnectError, initialSyncDone, now: Date.now(),
+  keySet: !!KEY
 }));
 
 // Debug env
@@ -298,7 +327,8 @@ app.get('/_debug/env', (req,res)=>{
 
 // -------- Hardening --------
 process.on('unhandledRejection', (r)=> console.error('[unhandledRejection]', r));
-process.on('uncaughtException', (e)=>{ console.error('[uncaughtException]', e); process.exit(1); });
+// Do not exit; log and keep the service alive
+process.on('uncaughtException', (e)=>{ console.error('[uncaughtException]', e); });
 
 // -------- Start --------
 app.listen(PORT, ()=> console.log(`BrandSocket Relay listening on :${PORT}`));
